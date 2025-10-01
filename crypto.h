@@ -62,7 +62,8 @@ typedef enum
 {
     PK_NONE = 0,
     PK_RSA,
-    PK_EC
+    PK_EC,
+    PK_MAYO
 } keytype_t;
 
 bool crypto_init(void);

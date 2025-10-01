@@ -73,6 +73,10 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+
+#include <oqs-provider/oqs_prov.h>
+#include <openssl/provider.h>
+
 #elif defined(USE_MBEDTLS)
 #include <mbedtls/asn1write.h>
 #include <mbedtls/base64.h>
@@ -1759,6 +1763,9 @@ static bool key_gen(keytype_t type, int bits, const char *keyfile)
 #elif defined(USE_OPENSSL)
     EVP_PKEY *key = NULL;
     EVP_PKEY_CTX *epc = NULL;
+    OSSL_LIB_CTX *libctx = NULL;
+    extern OSSL_provider_init_fn oqs_provider_init;
+    char ret = 0;
     switch (type) {
         case PK_RSA:
             epc = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
@@ -1766,6 +1773,18 @@ static bool key_gen(keytype_t type, int bits, const char *keyfile)
 
         case PK_EC:
             epc = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+            break;
+
+        case PK_MAYO:
+            //epc = EVP_PKEY_CTX_new_id(OQS_SIG_alg_mayo_1, NULL);
+            ret = OSSL_PROVIDER_add_builtin(libctx, "oqsprovider", oqs_provider_init);
+            if (ret != 1) {
+                fprintf(stderr,
+                        "`OSSL_PROVIDER_add_builtin` failed with returned code %i\n",
+                        ret);
+                return -1;
+            }
+            epc = EVP_PKEY_CTX_new_from_name(libctx, "mayo1", "provider=oqsprovider");
             break;
 
         default:
@@ -1813,6 +1832,10 @@ static bool key_gen(keytype_t type, int bits, const char *keyfile)
                     warnx("key_gen: EC key size must be either 256 or 384");
                     goto out;
             }
+            break;
+        
+        case PK_MAYO:
+            msg(1, "generating new mayo-1 key");
             break;
 
         default:
@@ -2225,9 +2248,14 @@ char *csr_gen(char * const *names, bool status_req, bool no_key_usage,
                     goto out;
             }
             break;
-
+        case PK_MAYO:
+#if defined(USE_OPENSSL)
+            key_usage = "critical, digitalSignature";
+            hash_type = EVP_sha256();
+            break;
+#endif
         default:
-            warnx("csr_gen: only RSA/EC keys are supported");
+            warnx("csr_gen: only RSA/EC/MAYO keys are supported");
             goto out;
     }
 

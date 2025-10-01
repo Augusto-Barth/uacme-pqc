@@ -1452,7 +1452,7 @@ void usage(const char *progname)
         "\t[-h|--hook PROG] [-i|--no-ari] [-k|--rotate-key]\n"
         "\t[-l|--alternate [N | SHA256]] [-m|--must-staple]\n"
         "\t[-n|--never-create] [-o|--no-ocsp] [-p|--profile profile]\n"
-        "\t[-r|--reason CODE] [-s|--staging] [-t|--type RSA | EC]\n"
+        "\t[-r|--reason CODE] [-s|--staging] [-t|--type RSA | EC | MAYO]\n"
         "\t[-v|--verbose ...] [-V|--version] [-y|--yes] [-?|--help]\n"
         "\tnew [EMAIL] | update [EMAIL] | deactivate | newkey |\n"
         "\tissue IDENTIFIER [ALTNAME ...] | issue CSRFILE |\n"
@@ -1661,8 +1661,10 @@ int main(int argc, char **argv)
                     type = PK_RSA;
                 else if (strcasecmp(optarg, "EC") == 0)
                     type = PK_EC;
+                else if (strcasecmp(optarg, "MAYO") == 0)
+                    type = PK_MAYO;
                 else {
-                    warnx("type must be either RSA or EC");
+                    warnx("type must be either RSA or EC or MAYO");
                     goto out;
                 }
                 break;
@@ -1711,9 +1713,13 @@ int main(int argc, char **argv)
                     goto out;
             }
             break;
+        
+        case PK_MAYO:
+            // bits is ignored for MAYO keys?
+            break;
 
         default:
-            warnx("key type must be either RSA or EC");
+            warnx("key type must be either RSA or EC or MAYO");
             goto out;
     }
 
