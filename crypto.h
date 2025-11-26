@@ -63,7 +63,8 @@ typedef enum
     PK_NONE = 0,
     PK_RSA,
     PK_EC,
-    PK_MAYO
+    PK_MAYO,
+    PK_DSA
 } keytype_t;
 
 bool crypto_init(void);
@@ -80,7 +81,7 @@ char *jws_encode_hmac(const char *, const char *, size_t, const char *);
 keytype_t key_type(privkey_t);
 privkey_t key_load(keytype_t, int bits, const char *, ...);
 bool is_ip(const char *, unsigned char *, size_t *);
-char *csr_gen(char * const *, bool, bool, privkey_t);
+char *csr_gen(char * const *, bool, privkey_t);
 char *csr_load(const char *, char ***);
 char *cert_der_base64url(const char *);
 bool cert_valid(const char *, char * const *, const char *, int, bool);

@@ -21,7 +21,6 @@
 #include "config.h"
 
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <err.h>
 #include <errno.h>
 #include <netdb.h>
@@ -967,6 +966,70 @@ out:
     }
 }
 
+int get_param_octet_string(const EVP_PKEY *key, const char *param_name, unsigned char **buf, size_t *buf_len)
+{
+    *buf = NULL;
+    *buf_len = 0;
+    int ret = -1;
+    size_t pk_len = 0;
+
+    if (EVP_PKEY_get_octet_string_param(key, param_name, NULL, 0, &pk_len) !=
+        1) {
+        warnx("`EVP_PKEY_get_octet_string_param` failed with param `%s`: ", param_name);
+        goto out;
+    }
+    unsigned char *tmp = malloc(pk_len + 2);
+    if (!tmp) {
+        warnx("failed to allocate %#zx byte(s)\n", *buf_len);
+        goto out;
+    }
+
+    tmp[0] = 0x02;
+    tmp[1] = 0x2a;
+
+    if (EVP_PKEY_get_octet_string_param(key, param_name, tmp+2, pk_len,
+                                        &pk_len) != 1) {
+        warnx("`EVP_PKEY_get_octet_string_param` failed with param `%s`: ", param_name);
+        free(*buf);
+    } else {
+        *buf = tmp;
+        *buf_len = pk_len + 2;
+        ret = 0;
+    }
+
+out:
+    return ret;
+}
+
+static size_t mayo_params(privkey_t key, char **x){
+    size_t r;
+    char *_x = NULL;
+    unsigned char *data = NULL;
+
+    if (get_param_octet_string(key, OSSL_PKEY_PARAM_PUB_KEY,
+                               &data, &r)) {
+        goto out;
+    }
+    
+    msg(1, "key size: %ld", r);
+    *x = bn2str(data, r, 0);
+    if (!*x) {
+        warnx("mayo_params: bn2str failed");
+        goto out;
+    }
+out:
+
+    if (*x) {
+        free(_x);
+        msg(1, "true");
+        return true;
+    } else {
+        free(_x);
+        msg(1, "false");
+        return false;
+    }
+}
+
 keytype_t key_type(privkey_t key)
 {
 #if defined(USE_GNUTLS)
@@ -976,7 +1039,7 @@ keytype_t key_type(privkey_t key)
         case GNUTLS_PK_EC:
             return PK_EC;
 #elif defined(USE_OPENSSL)
-    switch (EVP_PKEY_base_id(key)) {
+    switch (EVP_PKEY_get_base_id(key)) {
         case EVP_PKEY_RSA:
             return PK_RSA;
         case EVP_PKEY_EC:
@@ -989,6 +1052,10 @@ keytype_t key_type(privkey_t key)
             return PK_EC;
 #endif
         default:
+            if (EVP_PKEY_is_a(key, "mayo1")){
+                msg(1, "loaded mayo1 key");
+                return PK_MAYO;
+            }
             return PK_NONE;
     }
 }
@@ -1011,6 +1078,7 @@ char *jws_jwk(privkey_t key, const char **crv, const char **alg)
                 ret = NULL;
                 goto out;
             }
+            msg(1, "%s", ret);
             if (alg) *alg = "RS256";
             break;
 
@@ -1044,8 +1112,23 @@ char *jws_jwk(privkey_t key, const char **crv, const char **alg)
             }
             break;
 
+        case PK_MAYO:
+            if (!mayo_params(key, &p1)) {
+                warnx("jws_jwk: mayo_params failed");
+                goto out;
+            }
+            if (asprintf(&ret, "{\"pqcpub\":\"%s\",\"kty\":\"MAYO-1\"}",
+                        p1) < 0) {
+                warnx("jws_jwk: asprintf failed");
+                ret = NULL;
+                goto out;
+            }
+            msg(1, "%s", ret);
+            if (alg) *alg = "MAYO-1";
+            break;
+
         default:
-            warnx("jws_jwk: only RSA/EC keys are supported");
+            warnx("jws_jwk: only RSA/EC/MAYO keys are supported");
             goto out;
     }
  out:
@@ -1180,8 +1263,29 @@ char *jws_thumbprint(privkey_t key)
                 warnx("jws_thumbprint: sha2_base64url failed");
             break;
 
+        case PK_MAYO:
+            if (!rsa_params(key, &p1, &p2)) {
+                warnx("jws_thumbprint: rsa_params failed");
+                goto out;
+            }
+            ret = sha2_base64url(256, "{\"e\":\"%s\",\"kty\":\"RSA\","
+                    "\"n\":\"%s\"}", p2, p1);
+            if (!ret)
+                warnx("jws_thumbprint: sha2_base64url failed");
+            break;
+
+            if (!mayo_params(key, &p1)) {
+                warnx("jws_jwk: mayo_params failed");
+                goto out;
+            }
+            ret = sha2_base64url(256, "{\"pqcpub\":\"%s\",\"kty\":\"MAYO-1\"}",
+                        p1);
+            if (!ret)
+                warnx("jws_thumbprint: sha2_base64url failed");
+            break;
+
         default:
-            warnx("jws_thumbprint: only RSA/EC keys are supported");
+            warnx("jws_thumbprint: only RSA/EC/MAYO keys are supported");
             goto out;
     }
 out:
@@ -1531,8 +1635,13 @@ char *jws_encode(const char *protected, const char *payload,
             }
             break;
 
+        case PK_MAYO:
+            hash_size = 32;
+            hash_type = EVP_sha256();
+            break;
+
         default:
-            warnx("jws_encode: only RSA/EC keys are supported");
+            warnx("jws_encode: only RSA/EC/MAYO keys are supported");
             goto out;
     }
 
@@ -1786,9 +1895,18 @@ static bool key_gen(keytype_t type, int bits, const char *keyfile)
             }
             epc = EVP_PKEY_CTX_new_from_name(libctx, "mayo1", "provider=oqsprovider");
             break;
-
+        case PK_DSA:
+            ret = OSSL_PROVIDER_add_builtin(libctx, "oqsprovider", oqs_provider_init);
+            if (ret != 1) {
+                fprintf(stderr,
+                        "`OSSL_PROVIDER_add_builtin` failed with returned code %i\n",
+                        ret);
+                return -1;
+            }
+            epc = EVP_PKEY_CTX_new_from_name(libctx, "dilithium2", "provider=oqsprovider");
+            break;
         default:
-            warnx("key_gen: only RSA/EC keys are supported");
+            warnx("key_gen: only RSA/EC/MAYO/DSA keys are supported");
             goto out;
     }
     if (!epc) {
@@ -1838,8 +1956,12 @@ static bool key_gen(keytype_t type, int bits, const char *keyfile)
             msg(1, "generating new mayo-1 key");
             break;
 
+        case PK_DSA:
+            msg(1, "generating new dilithium-2 key");
+            break;
+
         default:
-            warnx("key_gen: only RSA/EC keys are supported");
+            warnx("key_gen: only RSA/EC/MAYO/DSA keys are supported");
             goto out;
     }
     if (!EVP_PKEY_keygen(epc, &key)) {
@@ -2111,6 +2233,10 @@ privkey_t key_load(keytype_t type, int bits, const char *format, ...)
             }
             break;
 
+        case PK_MAYO:
+            msg(1, "key_load: mayo key loaded");
+            break;
+
         default:
             warnx("key_load: only RSA/EC keys are supported");
             privkey_deinit(key);
@@ -2158,8 +2284,7 @@ bool is_ip(const char *s, unsigned char *ip, size_t *ip_len)
     return ret;
 }
 
-char *csr_gen(char * const *names, bool status_req, bool no_key_usage,
-        privkey_t key)
+char *csr_gen(char * const *names, bool status_req, privkey_t key)
 {
     char *req = NULL;
     unsigned char *csrdata = NULL;
@@ -2254,8 +2379,15 @@ char *csr_gen(char * const *names, bool status_req, bool no_key_usage,
             hash_type = EVP_sha256();
             break;
 #endif
+        case PK_DSA:
+#if defined(USE_OPENSSL)
+            key_usage = "critical, digitalSignature";
+            hash_type = EVP_sha256();
+            break;
+#endif
+
         default:
-            warnx("csr_gen: only RSA/EC/MAYO keys are supported");
+            warnx("csr_gen: only RSA/EC/MAYO/DSA keys are supported");
             goto out;
     }
 
@@ -2266,38 +2398,34 @@ char *csr_gen(char * const *names, bool status_req, bool no_key_usage,
         goto out;
     }
 
-    for (char * const *nm = names; *nm; nm++) {
+    r = gnutls_x509_crq_set_dn_by_oid(crq, GNUTLS_OID_X520_COMMON_NAME, 0,
+                *names, strlen(*names));
+    if (r != GNUTLS_E_SUCCESS) {
+        warnx("csr_gen: gnutls_x509_crq_set_dn_by_oid: %s", gnutls_strerror(r));
+        goto out;
+    }
+
+    while (*names) {
         ip_len = sizeof(ip);
-        if (is_ip(*nm, ip, &ip_len))
+        if (is_ip(*names, ip, &ip_len))
             r = gnutls_x509_crq_set_subject_alt_name(crq, GNUTLS_SAN_IPADDRESS,
                     ip, ip_len, GNUTLS_FSAN_APPEND);
-        else {
-            if (nm == names) {
-                r = gnutls_x509_crq_set_dn_by_oid(crq,
-                        GNUTLS_OID_X520_COMMON_NAME, 0, *nm, strlen(*nm));
-                if (r != GNUTLS_E_SUCCESS) {
-                    warnx("csr_gen: gnutls_x509_crq_set_dn_by_oid: %s",
-                            gnutls_strerror(r));
-                    goto out;
-                }
-            }
+        else
             r = gnutls_x509_crq_set_subject_alt_name(crq, GNUTLS_SAN_DNSNAME,
-                    *nm, strlen(*nm), GNUTLS_FSAN_APPEND);
-        }
+                    *names, strlen(*names), GNUTLS_FSAN_APPEND);
         if (r != GNUTLS_E_SUCCESS) {
             warnx("csr_gen: gnutls_x509_set_subject_alt_name: %s",
                     gnutls_strerror(r));
             goto out;
         }
+        names++;
     }
 
-    if (!no_key_usage) {
-        r = gnutls_x509_crq_set_key_usage(crq, key_usage);
-        if (r != GNUTLS_E_SUCCESS) {
-            warnx("csr_gen: gnutls_x509_crq_set_key_usage: %s",
-                    gnutls_strerror(r));
-            goto out;
-        }
+    r = gnutls_x509_crq_set_key_usage(crq, key_usage);
+    if (r != GNUTLS_E_SUCCESS) {
+        warnx("csr_gen: gnutls_x509_crq_set_key_usage: %s",
+                gnutls_strerror(r));
+        goto out;
     }
 
     if (status_req) {
@@ -2386,35 +2514,28 @@ char *csr_gen(char * const *names, bool status_req, bool no_key_usage,
         openssl_error("csr_gen");
         goto out;
     }
+    if (!(name = X509_NAME_new())) {
+        openssl_error("csr_gen");
+        goto out;
+    }
     if (!X509_REQ_set_pubkey(crq, key)) {
         openssl_error("csr_gen");
         goto out;
     }
-    if (is_ip(*names, NULL, NULL)) {
-        if (asprintf(&san, "IP:%s", *names) < 0) {
-            warnx("csr_gen: asprintf failed");
-            san = NULL;
-            goto out;
-        }
-    } else {
-        if (!(name = X509_NAME_new())) {
-            openssl_error("csr_gen");
-            goto out;
-        }
-        if (!X509_NAME_add_entry_by_txt(name, "CN",
-                    MBSTRING_ASC, (unsigned char *)*names, -1, -1, 0)) {
-            openssl_error("csr_gen");
-            goto out;
-        }
-        if (!X509_REQ_set_subject_name(crq, name)) {
-            openssl_error("csr_gen");
-            goto out;
-        }
-        if (asprintf(&san, "DNS:%s", *names) < 0) {
-            warnx("csr_gen: asprintf failed");
-            san = NULL;
-            goto out;
-        }
+    if (!X509_NAME_add_entry_by_txt(name, "CN",
+                MBSTRING_ASC, (unsigned char *)*names, -1, -1, 0)) {
+        openssl_error("csr_gen");
+        goto out;
+    }
+    if (!X509_REQ_set_subject_name(crq, name)) {
+        openssl_error("csr_gen");
+        goto out;
+    }
+    if (asprintf(&san, "%s:%s", is_ip(*names, NULL, NULL) ? "IP" : "DNS",
+                *names) < 0) {
+        warnx("csr_gen: asprintf failed");
+        san = NULL;
+        goto out;
     }
     while (*++names) {
         char *tmp = NULL;
@@ -2438,14 +2559,12 @@ char *csr_gen(char * const *names, bool status_req, bool no_key_usage,
         goto out;
     }
     sk_X509_EXTENSION_push(exts, ext);
-    if (!no_key_usage) {
-        ext = X509V3_EXT_conf_nid(NULL, NULL, NID_key_usage, key_usage);
-        if (!ext) {
-            openssl_error("csr_gen");
-            goto out;
-        }
-        sk_X509_EXTENSION_push(exts, ext);
+    ext = X509V3_EXT_conf_nid(NULL, NULL, NID_key_usage, key_usage);
+    if (!ext) {
+        openssl_error("csr_gen");
+        goto out;
     }
+    sk_X509_EXTENSION_push(exts, ext);
     if (status_req) {
 #if defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x3050000fL
         warnx("csr_gen: -m, --must-staple is not supported by LibreSSL "
@@ -2489,28 +2608,24 @@ char *csr_gen(char * const *names, bool status_req, bool no_key_usage,
     mbedtls_x509write_csr_set_key(&csr, key);
     mbedtls_x509write_csr_set_md_alg(&csr, hash_type);
 
-    if (!no_key_usage) {
-        r = mbedtls_x509write_csr_set_key_usage(&csr, key_usage);
-        if (r) {
-            warnx("csr_gen: mbedtls_x509write_csr_set_key_usage failed: %s",
-                    _mbedtls_strerror(r));
-            goto out;
-        }
+    if (asprintf(&cn, "CN=%s", *names) < 0) {
+        warnx("csr_gen: asprintf failed");
+        cn = NULL;
+        goto out;
     }
 
-    if (!is_ip(*names, NULL, NULL)) {
-        if (asprintf(&cn, "CN=%s", *names) < 0) {
-            warnx("csr_gen: asprintf failed");
-            cn = NULL;
-            goto out;
-        }
+    r = mbedtls_x509write_csr_set_key_usage(&csr, key_usage);
+    if (r) {
+        warnx("csr_gen: mbedtls_x509write_csr_set_key_usage failed: %s",
+                _mbedtls_strerror(r));
+        goto out;
+    }
 
-        r = mbedtls_x509write_csr_set_subject_name(&csr, cn);
-        if (r) {
-            warnx("csr_gen: mbedtls_x509write_csr_set_subject_name failed: %s",
-                    _mbedtls_strerror(r));
-            goto out;
-        }
+    r = mbedtls_x509write_csr_set_subject_name(&csr, cn);
+    if (r) {
+        warnx("csr_gen: mbedtls_x509write_csr_set_subject_name failed: %s",
+                _mbedtls_strerror(r));
+        goto out;
     }
 
     while (1) {
@@ -2524,8 +2639,7 @@ char *csr_gen(char * const *names, bool status_req, bool no_key_usage,
         unsigned char *p = buf + buflen;
         size_t len = 0;
         size_t count = 0;
-        while (names[count])
-            count++;
+        while (names[count]) count++;
         while (count--) {
             const unsigned char *data;
             size_t data_len;
@@ -3685,7 +3799,7 @@ static char *crt_ari_url(mbedtls_x509_crt *crt, const char *prefix)
     char akid_b64[base64_ENCODED_LEN(sizeof(akid),
             base64_VARIANT_URLSAFE_NO_PADDING)];
     unsigned char serial[128];
-    char serial_b64[base64_ENCODED_LEN(sizeof(serial),
+    char serial_b64[base64_ENCODED_LEN(sizeof(akid),
             base64_VARIANT_URLSAFE_NO_PADDING)];
     size_t alen = sizeof(akid);
     size_t slen = sizeof(serial);
@@ -4603,44 +4717,6 @@ out:
 }
 #endif
 
-static time_t parse_rfc3339_timestamp(const char *str)
-{
-    int n;
-    time_t t = (time_t)-1;
-    struct tm tm;
-
-    memset(&tm, 0, sizeof(tm));
-    if (sscanf(str, "%4d-%2d-%2d%*[Tt]%2d:%2d:%2d%n",
-                &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
-                &tm.tm_hour, &tm.tm_min, &tm.tm_sec, &n) != 6)
-        return (time_t)-1;
-    tm.tm_year -= 1900;
-    tm.tm_mon -= 1;
-    t = mktime(&tm);
-    if (t == (time_t)-1)
-        return (time_t)-1;
-    str += n;
-    str += strspn(str, ".0123456789");
-    if (toupper(*str) != 'Z') {
-        int tz, tzh, tzm;
-        if (strlen(str) < 6 ||
-            sscanf(str + 1, "%2d:%2d", &tzh, &tzm) != 2)
-                return (time_t)-1;
-        tz = 60*(60*tzh + tzm);
-        switch (*str) {
-            case '+':
-                t -= tz;
-                break;
-            case '-':
-                t += tz;
-                break;
-            default:
-                t = (time_t) -1;
-        }
-    }
-    return t;
-}
-
 #if defined(USE_GNUTLS)
 int ari_check(gnutls_x509_crt_t crt, const char *ari_url)
 #elif defined(USE_OPENSSL)
@@ -4696,12 +4772,23 @@ int ari_check(mbedtls_x509_crt *crt, const char *ari_url)
         goto out;
     }
     msg(1, "certificate renewal window: start=%s end=%s", start, end);
-    time_t start_t = parse_rfc3339_timestamp(start);
+    struct tm start_tm, end_tm;
+    p = strptime(start, "%Y-%m-%dT%T%z", &start_tm);
+    if (!p || *p) {
+        warnx("ari_check: failed to parse start");
+        goto out;
+    }
+    p = strptime(end, "%Y-%m-%dT%T%z", &end_tm);
+    if (!p || *p) {
+        warnx("ari_check: failed to parse end");
+        goto out;
+    }
+    time_t start_t = mktime(&start_tm);
     if (start_t == (time_t)-1) {
         warnx("ari_check: invalid start");
         goto out;
     }
-    time_t end_t = parse_rfc3339_timestamp(end);
+    time_t end_t = mktime(&end_tm);
     if (end_t == (time_t)-1) {
         warnx("ari_check: invalid end");
         goto out;

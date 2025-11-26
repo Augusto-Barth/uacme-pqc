@@ -262,7 +262,7 @@ if test "x$OPT_OPENSSL" != "xno"; then
             AC_MSG_RESULT([found $version])
         fi
     else
-        addlib="-lssl -lcrypto"
+        addlib="-lssl -lcrypto -L. -loqsprovider -loqs"
         addld=-L$OPT_OPENSSL/lib$libsuff
         addcflags=-I$OPT_OPENSSL/include
         openssllib=$OPT_OPENSSL/lib$libsuff
