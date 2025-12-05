@@ -128,12 +128,25 @@ void crypto_deinit(void)
 #error LibreSSL version 3.4.2 or later is required
 #endif
 
+OSSL_LIB_CTX *libctx = NULL;
 bool crypto_init(void)
 {
+    msg(1, "crypto_init");
     if (OpenSSL_version_num() < 0x1010100fL) {
         warnx("crypto_init: openssl version 1.1.1 or later is required");
         return false;
     }
+
+    extern OSSL_provider_init_fn oqs_provider_init;
+
+    int ret = OSSL_PROVIDER_add_builtin(libctx, "oqsprovider", oqs_provider_init);
+    if (ret != 1) {
+        fprintf(stderr,
+                "`OSSL_PROVIDER_add_builtin` failed with returned code %i\n",
+                ret);
+        return false;
+    }
+
     return true;
 }
 
@@ -298,6 +311,7 @@ char *sha2_base64url(size_t bits, const char *format, ...)
         input = NULL;
         goto out;
     }
+    msg(1, "sha2_base64url input: %s", input);
 
     hash = calloc(1, hash_len);
     if (!hash) {
@@ -984,8 +998,8 @@ int get_param_octet_string(const EVP_PKEY *key, const char *param_name, unsigned
         goto out;
     }
 
-    tmp[0] = 0x02;
-    tmp[1] = 0x2a;
+    tmp[0] = (uint8_t)0x02;
+    tmp[1] = (uint8_t)0x2a;
 
     if (EVP_PKEY_get_octet_string_param(key, param_name, tmp+2, pk_len,
                                         &pk_len) != 1) {
@@ -1001,7 +1015,76 @@ out:
     return ret;
 }
 
-static size_t mayo_params(privkey_t key, char **x){
+int get_param_octet_string_WITHOUT_SIGID(const EVP_PKEY *key, const char *param_name, unsigned char **buf, size_t *buf_len)
+{
+    *buf = NULL;
+    *buf_len = 0;
+    int ret = -1;
+    size_t pk_len = 0;
+
+    if (EVP_PKEY_get_octet_string_param(key, param_name, NULL, 0, &pk_len) !=
+        1) {
+        warnx("`EVP_PKEY_get_octet_string_param` failed with param `%s`: ", param_name);
+        goto out;
+    }
+    unsigned char *tmp = malloc(pk_len);
+    if (!tmp) {
+        warnx("failed to allocate %#zx byte(s)\n", *buf_len);
+        goto out;
+    }
+
+    if (EVP_PKEY_get_octet_string_param(key, param_name, tmp, pk_len,
+                                        &pk_len) != 1) {
+        warnx("`EVP_PKEY_get_octet_string_param` failed with param `%s`: ", param_name);
+        free(*buf);
+    } else {
+        *buf = tmp;
+        *buf_len = pk_len;
+        ret = 0;
+    }
+
+out:
+    return ret;
+}
+
+static size_t mayo_params(privkey_t key, char **x, char without_sigID){
+    size_t r;
+    char *_x = NULL;
+    unsigned char *data = NULL;
+
+    if (without_sigID){
+        if (get_param_octet_string_WITHOUT_SIGID(key, OSSL_PKEY_PARAM_PUB_KEY,
+                               &data, &r)) {
+        goto out;
+    }
+    }
+    else{
+        if (get_param_octet_string(key, OSSL_PKEY_PARAM_PUB_KEY,
+                                   &data, &r)) {
+            goto out;
+        }
+    }
+    
+    msg(1, "key size: %ld", r);
+    *x = bn2str(data, r, 0);
+    if (!*x) {
+        warnx("mayo_params: bn2str failed");
+        goto out;
+    }
+out:
+
+    if (*x) {
+        free(_x);
+        msg(1, "true");
+        return true;
+    } else {
+        free(_x);
+        msg(1, "false");
+        return false;
+    }
+}
+
+static size_t dsa_params(privkey_t key, char **x){
     size_t r;
     char *_x = NULL;
     unsigned char *data = NULL;
@@ -1021,11 +1104,9 @@ out:
 
     if (*x) {
         free(_x);
-        msg(1, "true");
         return true;
     } else {
         free(_x);
-        msg(1, "false");
         return false;
     }
 }
@@ -1053,8 +1134,12 @@ keytype_t key_type(privkey_t key)
 #endif
         default:
             if (EVP_PKEY_is_a(key, "mayo1")){
-                msg(1, "loaded mayo1 key");
+                // msg(1, "loaded mayo1 key");
                 return PK_MAYO;
+            }
+            if (EVP_PKEY_is_a(key, "mldsa44")){
+                // msg(1, "loaded dilithium2 key");
+                return PK_DSA;
             }
             return PK_NONE;
     }
@@ -1113,7 +1198,8 @@ char *jws_jwk(privkey_t key, const char **crv, const char **alg)
             break;
 
         case PK_MAYO:
-            if (!mayo_params(key, &p1)) {
+            msg(1, "JWS_JWK KEY: %X", key);
+            if (!mayo_params(key, &p1, 0)) {
                 warnx("jws_jwk: mayo_params failed");
                 goto out;
             }
@@ -1123,12 +1209,27 @@ char *jws_jwk(privkey_t key, const char **crv, const char **alg)
                 ret = NULL;
                 goto out;
             }
-            msg(1, "%s", ret);
+            msg(1, "JWS_JWK: %s", ret);
             if (alg) *alg = "MAYO-1";
             break;
 
+        case PK_DSA:
+            if (!dsa_params(key, &p1)) {
+                warnx("jws_jwk: dsa_params failed");
+                goto out;
+            }
+            if (asprintf(&ret, "{\"pqcpub\":\"%s\",\"kty\":\"Dilithium2\"}",
+                        p1) < 0) {
+                warnx("jws_jwk: asprintf failed");
+                ret = NULL;
+                goto out;
+            }
+            msg(1, "%s", ret);
+            if (alg) *alg = "Dilithium2";
+            break;
+
         default:
-            warnx("jws_jwk: only RSA/EC/MAYO keys are supported");
+            warnx("jws_jwk: only RSA/EC/MAYO/DSA keys are supported");
             goto out;
     }
  out:
@@ -1162,6 +1263,7 @@ char *jws_protected_jwk(const char *nonce, const char *url,
             ret = NULL;
         }
     }
+    msg(1, "%s\n", ret);
 out:
     free(jwk);
     return ret;
@@ -1196,9 +1298,13 @@ char *jws_protected_kid(const char *nonce, const char *url,
                     goto out;
             }
             break;
+        
+        case PK_MAYO:
+            alg = "MAYO-1";
+            break;
 
         default:
-            warnx("jws_protected_kid: only RSA/EC keys are supported");
+            warnx("jws_protected_kid: only RSA/EC/MAYO keys are supported");
             goto out;
     }
     if (asprintf(&ret, "{\"alg\":\"%s\",\"nonce\":\"%s\","
@@ -1264,28 +1370,38 @@ char *jws_thumbprint(privkey_t key)
             break;
 
         case PK_MAYO:
-            if (!rsa_params(key, &p1, &p2)) {
-                warnx("jws_thumbprint: rsa_params failed");
-                goto out;
-            }
-            ret = sha2_base64url(256, "{\"e\":\"%s\",\"kty\":\"RSA\","
-                    "\"n\":\"%s\"}", p2, p1);
-            if (!ret)
-                warnx("jws_thumbprint: sha2_base64url failed");
-            break;
-
-            if (!mayo_params(key, &p1)) {
+            msg(1, "JWS_THUMBPRINT KEY: %X", key);
+            if (!mayo_params(key, &p1, 1)) {
                 warnx("jws_jwk: mayo_params failed");
                 goto out;
             }
-            ret = sha2_base64url(256, "{\"pqcpub\":\"%s\",\"kty\":\"MAYO-1\"}",
+
+            printf("PUBKEY: ");
+            for(size_t i = 0; i < strlen(p1); i++){
+                printf("%c", p1[i]);
+            }
+            printf("\n");
+
+            ret = sha2_base64url(256, "{\"pub\":\"%s\",\"kty\":\"MAYO-1\"}", p1);
+            if (!ret)
+                warnx("jws_thumbprint: sha2_base64url failed");
+                
+            msg(1, "SHA2_BASE64URL: %s", ret);
+            break;
+
+        case PK_DSA:
+            if (!dsa_params(key, &p1)) {
+                warnx("jws_jwk: dsa_params failed");
+                goto out;
+            }
+            ret = sha2_base64url(256, "{\"pqcpub\":\"%s\",\"kty\":\"Dilithium2\"}",
                         p1);
             if (!ret)
                 warnx("jws_thumbprint: sha2_base64url failed");
             break;
 
         default:
-            warnx("jws_thumbprint: only RSA/EC/MAYO keys are supported");
+            warnx("jws_thumbprint: only RSA/EC/MAYO/DSA keys are supported");
             goto out;
     }
 out:
@@ -1567,6 +1683,7 @@ char *jws_encode(const char *protected, const char *payload,
     size_t signature_size = 0;
     char *encoded_signature = NULL;
     size_t hash_size = 0;
+    bool is_pq = false;
 #if defined(USE_GNUTLS)
     gnutls_digest_algorithm_t hash_type;
 #elif defined(USE_OPENSSL)
@@ -1636,7 +1753,13 @@ char *jws_encode(const char *protected, const char *payload,
             break;
 
         case PK_MAYO:
+            is_pq = true;
+            hash_type = EVP_sha256();
             hash_size = 32;
+            break;
+
+        case PK_DSA:
+            is_pq = true;
             hash_type = EVP_sha256();
             break;
 
@@ -1661,29 +1784,87 @@ char *jws_encode(const char *protected, const char *payload,
         goto out;
     }
 #elif defined(USE_OPENSSL)
-    emc = EVP_MD_CTX_create();
-    if (!emc) {
-        openssl_error("jws_encode");
-        goto out;
+
+    if (!is_pq){
+        emc = EVP_MD_CTX_create();
+        if (!emc) {
+            openssl_error("jws_encode");
+            goto out;
+        }
+        // signature = calloc(1, EVP_PKEY_size(key));
+        if (!EVP_SignInit_ex(emc, hash_type, NULL)) {
+            openssl_error("jws_encode");
+            goto out;
+        }
+        printf("PAYLOAD: ");
+        for(size_t i = 0; i < strlen(encoded_combined); i++){
+            printf("%X", encoded_combined[i]);
+        }
+        printf("\n");
+        if (!EVP_SignUpdate(emc, encoded_combined, strlen(encoded_combined))) {
+            openssl_error("jws_encode");
+            goto out;
+        }
+        if (!EVP_SignFinal(emc, NULL, &len, key)) {
+            openssl_error("jws_encode");
+            goto out;
+        }
+        signature = calloc(1, len);
+        if (!signature) {
+            warn("jws_encode: calloc failed");
+            goto out;
+        }
+        if (!EVP_SignFinal(emc, signature, &len, key)) {
+            openssl_error("jws_encode");
+            goto out;
+        }
     }
-    signature = calloc(1, EVP_PKEY_size(key));
-    if (!signature) {
-        warn("jws_encode: calloc failed");
-        goto out;
+                    
+    // }
+    
+    // signature = calloc(1, OQS_SIG_mayo_1_length_signature+3);
+    // // OQS_SIG_sign("MAYO-1", signature+3, OQS_SIG_mayo_1_length_signature, encoded_combined, strlen(encoded_combined), )
+    
+    if (is_pq){
+        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+        
+        unsigned char *hash = NULL;
+        // unsigned int hash_size = 0;
+        
+        EVP_DigestInit_ex(mdctx, hash_type, NULL);
+        EVP_DigestUpdate(mdctx, encoded_combined, strlen(encoded_combined));
+        // EVP_DigestFinal(mdctx, NULL, &hash_size);
+        hash = calloc(1, hash_size);
+        EVP_DigestFinal(mdctx, hash, &hash_size);
+        // printf("HASH: ");
+        // for(size_t i = 0; i < hash_size; i++){
+        //     printf("%02X", hash[i]);
+        // }
+        // printf("\n");
+        
+        EVP_DigestSignInit_ex(mdctx, NULL, NULL, libctx, NULL, key, NULL);
+        EVP_DigestSignUpdate(mdctx, hash, hash_size);
+        EVP_DigestSignFinal(mdctx, NULL, &signature_size);
+        signature = calloc(1, signature_size+3);
+        EVP_DigestSignFinal(mdctx, signature+3, &signature_size);
+        
+        signature[0] = 0x02;
+        signature[1] = (uint8_t)(signature_size >> 8);
+        signature[2] = (uint8_t)(signature_size & 0xFF);
+        signature_size = signature_size+3;
+        // msg(1, "Signature Length: %ld", signature_size);
+        // msg(1, "Signature: %d\n", signature[0]);
+
+        // EVP_DigestVerifyInit(emc, NULL, hash_type, NULL, key);
+        // EVP_DigestVerifyUpdate(emc, encoded_combined, strlen(encoded_combined));
+        // if(1 == EVP_DigestVerifyFinal(emc, signature+3, len))
+        // {
+        //     msg(1, "Verified Sign");/* Success */
+        // }
+        // else
+        // {
+        //     msg(1, "NOT Verified Sign");/* Failure */
     }
-    if (!EVP_SignInit_ex(emc, hash_type, NULL)) {
-        openssl_error("jws_encode");
-        goto out;
-    }
-    if (!EVP_SignUpdate(emc, encoded_combined, strlen(encoded_combined))) {
-        openssl_error("jws_encode");
-        goto out;
-    }
-    if (!EVP_SignFinal(emc, signature, &len, key)) {
-        openssl_error("jws_encode");
-        goto out;
-    }
-    signature_size = len;
 #elif defined(USE_MBEDTLS)
     hash = calloc(1, hash_size);
     if (!hash) {
@@ -1754,6 +1935,7 @@ char *jws_encode(const char *protected, const char *payload,
         warnx("jws_encode: asprintf failed");
         jws = NULL;
     }
+    msg(1, "JSW: %s\n", jws);
 out:
 #if defined(USE_OPENSSL)
     if (emc)
@@ -1872,9 +2054,6 @@ static bool key_gen(keytype_t type, int bits, const char *keyfile)
 #elif defined(USE_OPENSSL)
     EVP_PKEY *key = NULL;
     EVP_PKEY_CTX *epc = NULL;
-    OSSL_LIB_CTX *libctx = NULL;
-    extern OSSL_provider_init_fn oqs_provider_init;
-    char ret = 0;
     switch (type) {
         case PK_RSA:
             epc = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
@@ -1885,26 +2064,13 @@ static bool key_gen(keytype_t type, int bits, const char *keyfile)
             break;
 
         case PK_MAYO:
-            //epc = EVP_PKEY_CTX_new_id(OQS_SIG_alg_mayo_1, NULL);
-            ret = OSSL_PROVIDER_add_builtin(libctx, "oqsprovider", oqs_provider_init);
-            if (ret != 1) {
-                fprintf(stderr,
-                        "`OSSL_PROVIDER_add_builtin` failed with returned code %i\n",
-                        ret);
-                return -1;
-            }
             epc = EVP_PKEY_CTX_new_from_name(libctx, "mayo1", "provider=oqsprovider");
             break;
+
         case PK_DSA:
-            ret = OSSL_PROVIDER_add_builtin(libctx, "oqsprovider", oqs_provider_init);
-            if (ret != 1) {
-                fprintf(stderr,
-                        "`OSSL_PROVIDER_add_builtin` failed with returned code %i\n",
-                        ret);
-                return -1;
-            }
-            epc = EVP_PKEY_CTX_new_from_name(libctx, "dilithium2", "provider=oqsprovider");
+            epc = EVP_PKEY_CTX_new_from_name(libctx, "mldsa44", "provider=oqsprovider");
             break;
+
         default:
             warnx("key_gen: only RSA/EC/MAYO/DSA keys are supported");
             goto out;
@@ -2234,11 +2400,15 @@ privkey_t key_load(keytype_t type, int bits, const char *format, ...)
             break;
 
         case PK_MAYO:
-            msg(1, "key_load: mayo key loaded");
+            // msg(1, "key_load: mayo key loaded");
+            break;
+
+        case PK_DSA:
+            // msg(1, "key_load: dilithium key loaded");
             break;
 
         default:
-            warnx("key_load: only RSA/EC keys are supported");
+            warnx("key_load: only RSA/EC/MAYO keys are supported");
             privkey_deinit(key);
             key = NULL;
     }
