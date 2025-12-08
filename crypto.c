@@ -1818,6 +1818,7 @@ char *jws_encode(const char *protected, const char *payload,
             openssl_error("jws_encode");
             goto out;
         }
+        signature_size = len;
     }
                     
     // }
